@@ -1,0 +1,1 @@
+Download from <https://www.gnu.org/licenses/gcc-exception-3.1.txt> (the "GCC Runtime Library Exception 3.1"). Covers `libgcc_s_seh-1.dll` and `libstdc++-6.dll`.

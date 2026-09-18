@@ -1,0 +1,20 @@
+# Build artifacts
+RetroArch/
+__pycache__/
+*.pyc
+
+# One-time setup installers
+msys2-*.exe
+
+# Large generated data (use GitHub Releases instead)
+libretrodb.sqlite
+
+# Local virtualenvs / IDE
+.venv/
+.vscode/
+.idea/
+
+# OS noise
+Thumbs.db
+.DS_Store
+desktop.ini
