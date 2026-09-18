@@ -7,8 +7,10 @@ __pycache__/
 msys2-*.exe
 
 # Large generated data (use GitHub Releases instead)
-libretrodb.sqlite
 *.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 
 # Local virtualenvs / IDE
 .venv/
