@@ -11,6 +11,7 @@ See README.md for build and usage instructions.
 SPDX-License-Identifier: MIT
 """
 
+import argparse
 import contextlib
 import json
 import os
@@ -18,35 +19,34 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-RDB_DIR   = Path("database")
-TOOL      = "./libretrodb_tool.exe"   # use "./libretrodb_tool" on Linux/macOS
-OUTPUT_DB = "./libretrodb.sqlite"
+RDB_DIR          = Path("database")
+TOOL             = "./libretrodb_tool.exe"   # "./libretrodb_tool" on Linux/macOS
+DEFAULT_OUTPUT   = "./libretrodb.sqlite"
+SCHEMA_VERSION   = 1
+LIBRETRO_DB_URL  = "https://github.com/libretro/libretro-database"
 
-# RDB keys that become normalized lookup tables.  The corresponding column
-# on `games` is `<key>_id`.
 LOOKUP_FIELDS = {
     "developer":      "developers",
     "publisher":      "publishers",
     "genre":          "genres",
     "franchise":      "franchises",
-    "region":         "regions",             # comma-split before lookup
+    "region":         "regions",
     "enhancement_hw": "enhancement_hardware",
 }
 
-# RDB keys that belong to the `roms` table, linked via game_id.
 ROM_KEYS = {"rom_name", "size", "crc", "md5", "sha1"}
 
-# Game-level columns with explicit SQLite types.  Any other RDB key not
-# listed here (and not in LOOKUP_FIELDS/ROM_KEYS) is added as a TEXT column
-# on the fly.
 GAME_COLUMNS = [
     ("name",         "TEXT"),
     ("description",  "TEXT"),
+    ("thumbnail_name", "TEXT"),
     ("serial",       "TEXT"),
     ("releaseyear",  "INTEGER"),
     ("releasemonth", "INTEGER"),
@@ -63,7 +63,6 @@ GAME_COLUMNS = [
     ("coop",         "TEXT"),
 ]
 
-# Manufacturer inferred from the platform name (RDB filename stem).
 MANUFACTURER_BY_PREFIX = {
     "Nintendo":     "Nintendo",
     "Sega":         "Sega",
@@ -97,12 +96,14 @@ MANUFACTURER_BY_PREFIX = {
     "Watara":       "Watara",
 }
 
-
-def manufacturer_for(platform_name):
-    for prefix, manufacturer in MANUFACTURER_BY_PREFIX.items():
-        if platform_name.startswith(prefix):
-            return manufacturer
-    return None
+THUMBNAIL_BASE = "https://thumbnails.libretro.com"
+THUMBNAIL_TYPES = {
+    "boxart_url": "Named_Boxarts",
+    "snap_url":   "Named_Snaps",
+    "title_url":  "Named_Titles",
+    "logo_url":   "Named_Logos",
+}
+THUMBNAIL_ILLEGAL_CHARS = '&*/:<>?\\|"'
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +120,6 @@ def to_int(value):
 
 
 def normalise(value):
-    """Flatten a list-valued RDB field into a comma-joined string."""
     if isinstance(value, list):
         return ", ".join(str(v) for v in value)
     return value
@@ -142,6 +142,33 @@ def get_or_create(cur, table, value):
         return row[0]
     cur.execute(f"INSERT INTO {table} (name) VALUES (?)", (value,))
     return cur.lastrowid
+
+
+def manufacturer_for(platform_name):
+    for prefix, manufacturer in MANUFACTURER_BY_PREFIX.items():
+        if platform_name.startswith(prefix):
+            return manufacturer
+    return None
+
+
+def scrub_thumbnail_name(name):
+    if not name:
+        return None
+    for ch in THUMBNAIL_ILLEGAL_CHARS:
+        name = name.replace(ch, "_")
+    return name
+
+
+def build_thumbnail_url(platform, name, thumb_type):
+    safe = scrub_thumbnail_name(name)
+    if not safe:
+        return None
+    return (
+        f"{THUMBNAIL_BASE}/"
+        f"{quote(platform, safe='')}/"
+        f"{thumb_type}/"
+        f"{quote(safe, safe='')}.png"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +206,13 @@ def create_schema(cur):
     cur.execute("CREATE TABLE manufacturers "
                 "(id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
 
+    cur.execute("""
+        CREATE TABLE meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
     cur.execute("CREATE INDEX idx_games_system ON games(system)")
     cur.execute("CREATE INDEX idx_roms_game    ON roms(game_id)")
     cur.execute("CREATE INDEX idx_roms_crc     ON roms(crc)")
@@ -189,7 +223,7 @@ def create_schema(cur):
 # Per-RDB processing
 # ---------------------------------------------------------------------------
 
-def process_rdb(conn, rdb_path, system_slug, platform_name):
+def process_rdb(conn, rdb_path, system_slug, platform_name, sample=None):
     cur = conn.cursor()
 
     proc = subprocess.run(
@@ -215,12 +249,14 @@ def process_rdb(conn, rdb_path, system_slug, platform_name):
                         obj["serial"] = bytes.fromhex(obj["serial"]).decode("utf-8")
                 entries.append(obj)
 
+    if sample is not None:
+        entries = entries[:sample]
+
     if not entries:
         print(f"  ! No usable entries in {rdb_path.name}")
         return 0
 
-    # Discover extra keys and add them as TEXT columns on `games`.
-    known_keys = {n for n, _ in GAME_COLUMNS} | set(LOOKUP_FIELDS) | ROM_KEYS | {"name"}
+    known_keys = {n for n, _ in GAME_COLUMNS} | set(LOOKUP_FIELDS) | ROM_KEYS
     all_keys = set()
     for e in entries:
         all_keys.update(e.keys())
@@ -268,8 +304,11 @@ def process_rdb(conn, rdb_path, system_slug, platform_name):
         row = [system_slug, platform_name, manufacturer_id]
         row += [fk_ids[k] for k in LOOKUP_FIELDS]
         for name, sqltype in GAME_COLUMNS:
-            v = e.get(name)
-            row.append(to_int(v) if sqltype == "INTEGER" else v)
+            if name == "thumbnail_name":
+                row.append(scrub_thumbnail_name(e.get("name")))
+            else:
+                v = e.get(name)
+                row.append(to_int(v) if sqltype == "INTEGER" else v)
         for k in extra_keys:
             v = e.get(k)
             if isinstance(v, (list, dict)):
@@ -294,23 +333,171 @@ def process_rdb(conn, rdb_path, system_slug, platform_name):
 
 
 # ---------------------------------------------------------------------------
+# Post-processing
+# ---------------------------------------------------------------------------
+
+def populate_thumbnail_urls(conn):
+    cur = conn.cursor()
+    for col in THUMBNAIL_TYPES:
+        cur.execute(f"ALTER TABLE games ADD COLUMN {col} TEXT")
+
+    rows = cur.execute("SELECT id, platform, name FROM games").fetchall()
+    for col, thumb_type in THUMBNAIL_TYPES.items():
+        payload = [
+            (build_thumbnail_url(platform, name, thumb_type), gid)
+            for gid, platform, name in rows
+            if platform and name
+        ]
+        cur.executemany(f"UPDATE games SET {col} = ? WHERE id = ?", payload)
+        print(f"  {col}: populated")
+
+    conn.commit()
+    print(f"Thumbnail URLs populated for {len(rows)} games")
+
+
+def dedup_by_crc(conn):
+    cur = conn.cursor()
+    before = cur.execute("SELECT COUNT(*) FROM games").fetchone()[0]
+
+    cur.execute("""
+        DELETE FROM games WHERE id IN (
+            SELECT g.id FROM games g
+            JOIN roms r ON r.game_id = g.id
+            WHERE r.crc IS NOT NULL
+              AND g.id NOT IN (
+                  SELECT MIN(g2.id) FROM games g2
+                  JOIN roms r2 ON r2.game_id = g2.id
+                  WHERE r2.crc IS NOT NULL
+                  GROUP BY r2.crc
+              )
+        )
+    """)
+    cur.execute("DELETE FROM roms WHERE game_id NOT IN (SELECT id FROM games)")
+    conn.commit()
+
+    after = cur.execute("SELECT COUNT(*) FROM games").fetchone()[0]
+    print(f"Dedup by CRC32: removed {before - after} duplicate games")
+
+def verify(conn) -> int:
+    """Run post-build sanity checks.  Returns 0 on success, 1 on failure."""
+    cur = conn.cursor()
+    failures = []
+
+    def q1(sql, *args):
+        row = cur.execute(sql, args).fetchone()
+        return row[0] if row else 0
+
+    checks = [
+        # (label, value, minimum, critical?)
+        ("games total",           q1("SELECT COUNT(*) FROM games"),         1,     True),
+        ("roms total",            q1("SELECT COUNT(*) FROM roms"),          1,     True),
+        ("systems",               q1("SELECT COUNT(DISTINCT system) FROM games"), 100, True),
+        ("games with a name",     q1("SELECT COUNT(*) FROM games WHERE name IS NOT NULL AND name != ''"),  1, True),
+        ("games with a developer", q1("SELECT COUNT(*) FROM games WHERE developer_id IS NOT NULL"),  1, False),
+        ("games with a release year", q1("SELECT COUNT(*) FROM games WHERE releaseyear IS NOT NULL"), 1, False),
+        ("roms with a CRC32",     q1("SELECT COUNT(*) FROM roms WHERE crc IS NOT NULL"),   1, False),
+        ("roms with an MD5",      q1("SELECT COUNT(*) FROM roms WHERE md5 IS NOT NULL"),   1, False),
+        ("roms with a SHA1",      q1("SELECT COUNT(*) FROM roms WHERE sha1 IS NOT NULL"),  1, False),
+        ("roms with a size",      q1("SELECT COUNT(*) FROM roms WHERE size IS NOT NULL"),  1, False),
+        ("regions lookup",        q1("SELECT COUNT(*) FROM regions"),       1,     False),
+        ("developers lookup",     q1("SELECT COUNT(*) FROM developers"),    1,     False),
+    ]
+
+    print("\n--- Verification ---")
+    for label, value, minimum, critical in checks:
+        ok = value >= minimum
+        marker = "OK " if ok else "!! "
+        print(f"  {marker}{label:30s} {value}")
+        if not ok and critical:
+            failures.append(label)
+
+    # Orphan check: games with no ROMs, or ROMs pointing at a missing game
+    orphans_g = q1("SELECT COUNT(*) FROM games WHERE id NOT IN (SELECT DISTINCT game_id FROM roms)")
+    orphans_r = q1("SELECT COUNT(*) FROM roms WHERE game_id NOT IN (SELECT id FROM games)")
+    print(f"  {'OK ' if orphans_g == 0 else '!! '}orphan games (no ROM row)    {orphans_g}")
+    print(f"  {'OK ' if orphans_r == 0 else '!! '}orphan roms (no game row)     {orphans_r}")
+    if orphans_g or orphans_r:
+        failures.append("orphans")
+
+    if failures:
+        print(f"\nVerification FAILED: {', '.join(failures)}")
+        return 1
+    print("\nVerification OK")
+    return 0
+
+def get_build_timestamp() -> str:
+    """Return an ISO-8601 UTC timestamp.
+
+    Honors SOURCE_DATE_EPOCH for reproducible builds:
+    https://reproducible-builds.org/specs/source-date-epoch/
+    """
+    epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if epoch and epoch.isdigit():
+        dt = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def write_meta(conn, total_games):
+    cur = conn.cursor()
+    rom_count = cur.execute("SELECT COUNT(*) FROM roms").fetchone()[0]
+    meta = {
+        "schema_version":     str(SCHEMA_VERSION),
+        "generated_at":       get_build_timestamp(),
+        "libretro_database":  LIBRETRO_DB_URL,
+        "game_count":         str(total_games),
+        "rom_count":          str(rom_count),
+    }
+    cur.executemany("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    meta.items())
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Convert Libretro .rdb files into a SQLite database.",
+    )
+    p.add_argument("--output", default=DEFAULT_OUTPUT,
+                   help=f"Output SQLite file (default: {DEFAULT_OUTPUT})")
+    p.add_argument("--thumbnails", action="store_true",
+                   help="Add boxart/snap/title/logo URL columns "
+                        "(adds ~300 MB to the DB)")
+    p.add_argument("--dedup", action="store_true",
+                   help="Remove duplicate games that share a CRC32 "
+                        "(keeps the first occurrence)")
+    p.add_argument("--sample", type=int, default=None, metavar="N",
+                   help="Only process the first N entries per system "
+                        "(for testing; the resulting DB is incomplete)")
+    p.add_argument("--verify", action="store_true",
+                   help="Run post-build sanity checks and exit non-zero on failure")
+    p.add_argument("--vacuum", action="store_true",
+                   help="Compact the database after building "
+                        "(slower, but reclaims space freed by --dedup or --thumbnails)")
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
+
     if not RDB_DIR.is_dir():
         sys.exit(f"Error: {RDB_DIR}/ not found. Run from the project root.")
 
-    if os.path.exists(OUTPUT_DB):
-        os.remove(OUTPUT_DB)
+    if os.path.exists(args.output):
+        os.remove(args.output)
 
-    conn = sqlite3.connect(OUTPUT_DB)
+    conn = sqlite3.connect(args.output)
     cur = conn.cursor()
     create_schema(cur)
     conn.commit()
 
     rdb_files = sorted(RDB_DIR.glob("*.rdb"))
     print(f"Found {len(rdb_files)} .rdb files in {RDB_DIR}/")
+    if args.sample:
+        print(f"Sample mode: max {args.sample} entries per system")
 
     total = 0
     for rdb in rdb_files:
@@ -322,14 +509,34 @@ def main():
             slug = slug.replace("__", "_")
         slug = slug.strip("_")
 
-        n = process_rdb(conn, rdb, slug, platform_name)
+        n = process_rdb(conn, rdb, slug, platform_name, sample=args.sample)
         print(f"{slug}: {n} entries")
         total += n
 
     conn.commit()
-    conn.close()
     print(f"\nTotal: {total} games")
-    print(f"Done -> {OUTPUT_DB}")
+
+    if args.dedup:
+        dedup_by_crc(conn)
+
+    if args.thumbnails:
+        print("\nPopulating thumbnail URLs...")
+        populate_thumbnail_urls(conn)
+
+    write_meta(conn, total)
+
+    if args.vacuum:
+        print("\nVacuuming...")
+        conn.execute("VACUUM")
+        conn.commit()
+
+    exit_code = 0
+    if args.verify:
+        exit_code = verify(conn)
+
+    conn.close()
+    print(f"\nDone -> {args.output}")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

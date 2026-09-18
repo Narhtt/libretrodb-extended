@@ -8,6 +8,7 @@ msys2-*.exe
 
 # Large generated data (use GitHub Releases instead)
 libretrodb.sqlite
+*.sqlite
 
 # Local virtualenvs / IDE
 .venv/

@@ -1,4 +1,4 @@
-# libretrodb-sqlite
+# libretrodb-extended
 
 A modern rebuild of the [Libretro database](https://github.com/libretro/libretro-database)
 as a single normalized SQLite file, covering all 146 systems, with CRC32 /
@@ -12,7 +12,9 @@ Intended as an up-to-date, richer replacement for
 
 - `libretro2sqlite.py` — the converter (MIT)
 - `database/` — the source `.rdb` files from libretro-database (MIT)
-- `libretrodb.sqlite` — generated output (MIT)
+- `libretrodb.sqlite` — generated output (MIT); **not committed** — 
+  download from the [Releases](../../releases) page or regenerate locally.
+- `LICENSES/` — third-party license texts for the optional `libretrodb_tool.exe` binary.
 - `libretrodb_tool.exe` — optional, compiled RetroArch helper (GPLv3)
 
 ## Requirements
@@ -64,7 +66,7 @@ cp libretrodb_tool /path/to/retrodb/data/
 
 Then in `libretro2sqlite.py`, set:
 
-```python
+```console
 TOOL = "./libretrodb_tool"
 ```
 
@@ -72,15 +74,63 @@ TOOL = "./libretrodb_tool"
 
 From the project folder:
 
-```
+```console
 python3 libretro2sqlite.py
 ```
 
 You will see one line per system, then a total. The output file
 `libretrodb.sqlite` is regenerated from scratch on every run.
 
-Runtime: roughly 5–10 minutes depending on disk speed, for ~1.5 million
-entries.
+Runtime: a few minutes on a modern SSD (up to ~10 minutes on slow storage 
+or with `--thumbnails --vacuum`).
+
+### Reproducible builds
+
+Pass `SOURCE_DATE_EPOCH` to produce a byte-identical database across runs.
+
+POSIX shell / bash:
+
+```bash
+SOURCE_DATE_EPOCH=0 python3 libretro2sqlite.py
+```
+
+PowerShell:
+
+```powershell
+$env:SOURCE_DATE_EPOCH = "0"
+python3 libretro2sqlite.py
+Remove-Item Env:\SOURCE_DATE_EPOCH   # optional cleanup
+```
+
+The timestamp recorded in the `meta` table is fixed to that epoch. This is
+required if you want to verify a downloaded `libretrodb.sqlite` against a
+published SHA-256 checksum.
+
+### Post-build verification
+
+Pass `--verify` to run sanity checks after the build:
+
+```console
+python3 libretro2sqlite.py --verify
+```
+
+The script asserts that games, ROMs, systems and names are non-zero, and
+reports how many rows carry each optional field (developer, year, CRC, etc.).
+Exits with code 1 if a critical check fails — useful in CI.
+
+### Reclaiming space
+
+`--dedup` and `--thumbnails` leave freed pages inside the SQLite file —
+the file size does not shrink after a `DELETE` or an `ALTER TABLE`. Pass
+`--vacuum` to compact the database at the end of the build:
+
+```console
+python3 libretro2sqlite.py --dedup --vacuum
+```
+
+This runs SQLite's `VACUUM` command, which rewrites the file with only the
+live pages and rebuilds the indexes. Expect a 10–20% size reduction and
+slightly faster lookups. Cost: a few extra seconds on a 300 MB database.
 
 ## Schema
 
@@ -91,7 +141,8 @@ games
   region_id, enhancement_hw_id,
   name, description, serial, releaseyear, releasemonth, releaseday,
   users, tgdb_rating, esrb_rating, pegi_rating, cero_rating,
-  bbfc_rating, elspa_rating, rumble, analog, coop
+  bbfc_rating, elspa_rating, rumble, analog, coop,
+  boxart_url, snap_url, title_url, logo_url   -- only with --thumbnails
   -- any extra RDB key becomes an additional TEXT column
 
 roms
@@ -105,6 +156,69 @@ regions, enhancement_hardware, manufacturers
 - `system` is a slug suitable for joins: `nintendo_game_boy_advance`
 - `platform` is the official RetroArch name: `Nintendo - Game Boy Advance`
 - A single game may have multiple rows in `roms` (multi-disc, multi-region)
+
+## Command-line flags
+
+| Flag | Effect |
+|---|---|
+| `--output PATH` | Write to a different file (default `./libretrodb.sqlite`) |
+| `--thumbnails`  | Add `boxart_url`, `snap_url`, `title_url`, `logo_url` columns (+~300 MB) |
+| `--dedup`       | Remove duplicate games that share a CRC32 (keeps the first) |
+| `--vacuum`      | Compact the database at the end of the build. Reclaims the space freed by `--dedup` or `--thumbnails`. Slower, but produces the smallest possible file. |
+| `--sample N`    | Process only the first N entries per system (testing) |
+| `--verify`      | Run post-build sanity checks; exits non-zero if a critical check fails |
+
+> [!IMPORTANT]
+> `--dedup` runs before `--thumbnails` when both are set.
+
+## Deduplication
+
+The default build keeps every entry, because different systems legitimately
+share ROMs (a Neo Geo game appears in both `fbneo_arcade_games` and
+`snk_neo_geo`). If you want a one-row-per-ROM catalog, either pass `--dedup`
+at build time, or dedup on the fly:
+
+```sql
+SELECT g.* FROM games g
+JOIN roms r ON r.game_id = g.id
+WHERE g.id IN (
+    SELECT MIN(g2.id) FROM games g2
+    JOIN roms r2 ON r2.game_id = g2.id
+    WHERE r2.crc IS NOT NULL
+    GROUP BY r2.crc
+);
+```
+> Note: deduping by CRC32 is not collision-proof. For stricter uniqueness,
+> use MD5 or SHA1 instead of CRC in the queries above.
+
+## Thumbnail URLs
+
+Each game row carries four pre-computed thumbnail URLs pointing at the
+public libretro thumbnail server:
+
+- `boxart_url` — cover art
+- `snap_url`   — in-game screenshot
+- `title_url`  — title screen
+- `logo_url`   — game logo
+
+These are generated using RetroArch's filename convention: illegal
+characters (`&*/:<>?\|"`) are replaced with underscores. Many games have
+no thumbnail on the server, so a 404 is normal — front-ends should fall
+back to a placeholder image.
+
+## Output size
+
+The generated `libretrodb.sqlite` contains approximately **738,000 games**
+and an equal number of ROM rows. File size:
+
+| Build | Size |
+|---|---|
+| default | ~300 MB |
+| `--dedup` + `--vacuum` | ~270 MB |
+| `--thumbnails` | ~700 MB |
+| `--thumbnails --dedup --vacuum` | ~630 MB |
+
+> The `--dedup` flag removes ~74,000 duplicate rows (~10%).
 
 ## Example queries
 
@@ -147,11 +261,6 @@ git clone --depth=1 https://github.com/libretro/libretro-database
 cp libretro-database/dat/rdb/*.rdb database/
 python3 libretro2sqlite.py
 ```
-
-## Output size
-
-The generated `libretrodb.sqlite` contains approximately **738,000 games**
-and an equal number of ROM rows, totalling roughly 150 MB on disk.
 
 ## License
 
