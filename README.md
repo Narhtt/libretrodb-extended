@@ -208,15 +208,18 @@ back to a placeholder image.
 
 ## Output size
 
-The generated `libretrodb.sqlite` contains approximately **738,000 games**
-and an equal number of ROM rows. File size:
+The generated database contains approximately **738,000 games** and an
+equal number of ROM rows (about **664,000** after `--dedup`).
 
-| Build | Size |
-|---|---|
-| default | ~300 MB |
-| `--dedup` + `--vacuum` | ~270 MB |
-| `--thumbnails` | ~700 MB |
-| `--thumbnails --dedup --vacuum` | ~630 MB |
+| Variant | Build | Size |
+|---|---|---|
+| Full | `python3 libretro2sqlite.py --vacuum` | 300 MB |
+| Deduplicated | `python3 libretro2sqlite.py --dedup --vacuum` | 267 MB |
+| Deduplicated + thumbnails | `python3 libretro2sqlite.py --dedup --thumbnails --vacuum` | 673 MB |
+
+Sizes are for the compacted (`--vacuum`) builds. Without `--vacuum`, the
+deduplicated variant stays at ~300 MB because SQLite does not shrink the
+file after `DELETE` — see *Reclaiming space* above.
 
 > The `--dedup` flag removes ~74,000 duplicate rows (~10%).
 
